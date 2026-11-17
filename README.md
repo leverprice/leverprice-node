@@ -8,10 +8,10 @@
 </p>
 
 <p>
-  <a href="https://www.npmjs.com/package/@leverprice/sdk"><img alt="npm" src="https://img.shields.io/npm/v/%40leverprice%2Fsdk?label=npm&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
-  <a href="https://jsr.io/@leverprice/sdk"><img alt="JSR" src="https://img.shields.io/jsr/v/%40leverprice/sdk?label=jsr&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
+  <a href="https://www.npmjs.com/package/@leverprice/sdk"><img alt="npm" src="https://img.shields.io/npm/v/%40leverprice%2Fsdk?label=npm&style=flat-square&labelColor=0F1011&color=3C3F44"></a>
+  <a href="https://jsr.io/@leverprice/sdk"><img alt="JSR" src="https://img.shields.io/jsr/v/%40leverprice/sdk?label=jsr&style=flat-square&labelColor=0F1011&color=3C3F44"></a>
   <a href="https://github.com/leverprice/leverprice-node/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/leverprice/leverprice-node/ci.yml?branch=main&label=ci&style=flat-square&labelColor=0F1011"></a>
-  <a href="https://github.com/leverprice/leverprice-node/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-5B4CF5?style=flat-square&labelColor=0F1011"></a>
+  <a href="https://github.com/leverprice/leverprice-node/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-3C3F44?style=flat-square&labelColor=0F1011"></a>
 </p>
 
 Server-side SDK for [Leverprice](https://leverprice.com) price experiments. Zero dependencies (WebCrypto and `fetch` only), ESM and CommonJS, full TypeScript types.
