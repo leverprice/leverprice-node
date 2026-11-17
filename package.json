@@ -1,0 +1,65 @@
+{
+  "name": "@leverprice/sdk",
+  "version": "0.3.0",
+  "description": "Server-side SDK for Leverprice price experiments. Zero dependencies: Node, Bun, Deno, Cloudflare Workers, Vercel, Netlify and other edge runtimes.",
+  "license": "MIT",
+  "homepage": "https://leverprice.com/docs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leverprice/leverprice-node.git"
+  },
+  "bugs": "https://github.com/leverprice/leverprice-node/issues",
+  "keywords": [
+    "leverprice",
+    "pricing",
+    "price-experiments",
+    "a-b-testing",
+    "stripe",
+    "polar",
+    "lemonsqueezy",
+    "saas"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json && tsc -p test/tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "test:runtimes": "npm run build && node scripts/check-runtimes.mjs",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.8.3",
+    "@types/node": "^26.6.6",
+    "typescript": "^5.9.3",
+    "vitest": "~4.1.12"
+  }
+}
