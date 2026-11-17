@@ -28,5 +28,17 @@ jobs:
           test "$(node -p 'require("./jsr.json").version')" = "$v"
       - run: npm run typecheck && npm test && npm run build
       # npm trusted publishing (OIDC): no token; provenance is attached automatically.
-      - run: npm publish --access public
-      - run: deno publish
+      - name: Publish to npm
+        run: |
+          if npm view "@leverprice/sdk@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then
+            echo "@leverprice/sdk@${GITHUB_REF_NAME#v} is already on npm"
+          else
+            npm publish --access public
+          fi
+      - name: Publish to JSR
+        run: |
+          if curl -sf "https://jsr.io/@leverprice/sdk/${GITHUB_REF_NAME#v}_meta.json" >/dev/null; then
+            echo "@leverprice/sdk@${GITHUB_REF_NAME#v} is already on JSR"
+          else
+            deno publish
+          fi
