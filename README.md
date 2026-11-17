@@ -1,9 +1,11 @@
+<p>
 <a href="https://leverprice.com">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/leverprice/.github/main/assets/repo/node-dark.svg">
     <img alt="Leverprice SDK for Node.js" src="https://raw.githubusercontent.com/leverprice/.github/main/assets/repo/node-light.svg" width="100%">
   </picture>
 </a>
+</p>
 
 <p>
   <a href="https://www.npmjs.com/package/@leverprice/sdk"><img alt="npm" src="https://img.shields.io/npm/v/%40leverprice%2Fsdk?label=npm&style=flat-square&labelColor=0F1011&color=5B4CF5"></a>
