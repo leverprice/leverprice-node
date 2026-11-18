@@ -84,6 +84,134 @@ export function normalizeCountry(value: unknown): string | null {
   return code !== undefined && !NOT_A_COUNTRY.has(code) ? code : null;
 }
 
+/**
+ * Headers every browser or client sends itself: never a source for the visitor's country, since
+ * a visitor could pick their own price with them. The same rule as the dashboard's.
+ */
+export function visitorSetHeader(name: string): boolean {
+  const lower = name.replace(/[A-Z]+/g, (upper) => upper.toLowerCase());
+  return /^(sec-|accept|content-|if-|x-forwarded-|proxy-)/.test(lower) || VISITOR_SET_HEADERS.has(lower);
+}
+
+const VISITOR_SET_HEADERS = new Set([
+  "authorization",
+  "cache-control",
+  "connection",
+  "cookie",
+  "dnt",
+  "forwarded",
+  "host",
+  "origin",
+  "pragma",
+  "priority",
+  "purpose",
+  "range",
+  "referer",
+  "te",
+  "upgrade-insecure-requests",
+  "user-agent",
+  "via",
+  "x-real-ip",
+  "x-requested-with",
+]);
+
+/**
+ * Headers proxies and hosts set to the visitor's IP address, in the order they are read. Only a
+ * visitor without a cookie is told apart by it, so a forged one picks no more than clearing cookies.
+ */
+const ADDRESS_HEADERS = [
+  "cf-connecting-ip",
+  "true-client-ip",
+  "fastly-client-ip",
+  "fly-client-ip",
+  "x-real-ip",
+  "x-forwarded-for",
+];
+
+/** The visitor's address: the first address header that holds one, else the connection's. */
+export function clientAddress(request: RequestLike | null | undefined): string | null {
+  if (!request) return null;
+  for (const name of ADDRESS_HEADERS) {
+    const value = readHeader(request, name);
+    if (value === null) continue;
+    const address = normalizeAddress(value.split(",")[0]);
+    if (address !== null) return address;
+  }
+  return normalizeAddress(connectionAddress(request));
+}
+
+/** Node's `IncomingMessage` (and Express) carry the peer's address on the socket. */
+function connectionAddress(request: object): string | null {
+  try {
+    const own = (request as { ip?: unknown }).ip;
+    if (typeof own === "string") return own;
+    const socket = (request as { socket?: { remoteAddress?: unknown } }).socket;
+    return typeof socket?.remoteAddress === "string" ? socket.remoteAddress : null;
+  } catch {
+    return null;
+  }
+}
+
+const IPV4_RE = /^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$/;
+const HEX_GROUP_RE = /^[0-9A-Fa-f]{1,4}$/;
+
+function ipv4(text: string): number[] | null {
+  const m = IPV4_RE.exec(text);
+  if (!m) return null;
+  const parts = m.slice(1).map(Number);
+  return parts.every((n) => n <= 255) ? parts : null;
+}
+
+function ipv6(text: string): number[] | null {
+  let s = text;
+  if (s.includes(".")) {
+    const colon = s.lastIndexOf(":");
+    const v4 = ipv4(s.slice(colon + 1));
+    if (colon < 0 || !v4) return null;
+    s = `${s.slice(0, colon + 1)}${((v4[0]! << 8) | v4[1]!).toString(16)}:${((v4[2]! << 8) | v4[3]!).toString(16)}`;
+  }
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 ? (halves[1] ? halves[1].split(":") : []) : null;
+  const groups = [...head, ...(tail ?? [])];
+  if (!groups.every((g) => HEX_GROUP_RE.test(g))) return null;
+  const parse = (g: string) => Number.parseInt(g, 16);
+  if (tail === null) return groups.length === 8 ? groups.map(parse) : null;
+  if (groups.length > 7) return null;
+  return [...head.map(parse), ...Array<number>(8 - groups.length).fill(0), ...tail.map(parse)];
+}
+
+/**
+ * An address in one spelling: IPv4 in decimal (`203.0.113.7`), IPv6 cut to its /64 network as four
+ * lowercase hex groups (`2001:db8:0:1`), since phones change the rest of it every day. Accepts a
+ * port (`203.0.113.7:443`, `[2001:db8::1]:443`), brackets and a zone (`%eth0`); null otherwise.
+ */
+export function normalizeAddress(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  let s = value.replace(/^[ \t]+|[ \t]+$/g, "");
+  if (s.startsWith("[")) {
+    const end = s.indexOf("]");
+    if (end < 0 || (end + 1 < s.length && !/^:[0-9]{1,5}$/.test(s.slice(end + 1)))) return null;
+    s = s.slice(1, end);
+  } else if (/^[0-9.]+:[0-9]{1,5}$/.test(s)) {
+    s = s.slice(0, s.indexOf(":"));
+  }
+  const zone = s.indexOf("%");
+  if (zone >= 0) s = s.slice(0, zone);
+  const v4 = ipv4(s);
+  if (v4) return v4.join(".");
+  const v6 = ipv6(s);
+  if (!v6) return null;
+  if (v6.slice(0, 5).every((g) => g === 0) && v6[5] === 0xffff) {
+    return [v6[6]! >> 8, v6[6]! & 255, v6[7]! >> 8, v6[7]! & 255].join(".");
+  }
+  return v6
+    .slice(0, 4)
+    .map((g) => g.toString(16))
+    .join(":");
+}
+
 export interface RequestInput {
   request?: RequestLike | null;
   cookie?: string | null;

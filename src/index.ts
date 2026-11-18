@@ -10,7 +10,15 @@ import {
   signAssignment,
   verifyAssignment,
 } from "./cookie.ts";
-import { normalizeCountry, type RequestInfo, type RequestLike, readHeader, readRequest } from "./request.ts";
+import {
+  clientAddress,
+  normalizeCountry,
+  type RequestInfo,
+  type RequestLike,
+  readHeader,
+  readRequest,
+  visitorSetHeader,
+} from "./request.ts";
 import { type SigningKey, TrustChain } from "./trust.ts";
 import {
   bucketFor,
@@ -29,12 +37,15 @@ import {
 import {
   CONFIG_VERSION_HEADER,
   type Config,
+  ConfigError,
+  type ConfigErrorCode,
   type ConfigExperiment,
   type ConfigProduct,
   type ConfigRegion,
   eventProblem,
   MAX_EVENTS_PER_REQUEST,
   type ProviderName,
+  STANDARD_LEVEL,
   type WireEvent,
 } from "./wire.ts";
 
@@ -42,7 +53,7 @@ export { isBot } from "./bots.ts";
 export type { FetchRequestLike, NodeRequestLike, RequestLike } from "./request.ts";
 export type { ProviderName } from "./wire.ts";
 
-export const SDK_VERSION = "0.4.0";
+export const SDK_VERSION = "0.4.1";
 
 /** Production root public keys (raw Ed25519, base64url) by id. */
 export const ROOT_PUBLIC_KEYS: Record<string, string> = {
@@ -99,7 +110,8 @@ export interface LeverpriceOptions {
   cookieDomain?: string;
   /**
    * Request header your CDN or host sets to the visitor's country, such as `cf-ipcountry`.
-   * Overrides the project's country setting in Leverprice. Name only a header visitors cannot set.
+   * Overrides the project's country setting in Leverprice. A header every browser sends itself
+   * (`accept-language`, `x-forwarded-for`…) is ignored and reported to `onError`.
    */
   countryHeader?: string;
   /**
@@ -134,7 +146,10 @@ export interface Quote {
   price: number;
   /** Lowercase ISO 4217 code. With a regional price it can differ from the product's currency. */
   currency: string;
-  /** The visitor's country (ISO 3166-1 alpha-2), when known. */
+  /**
+   * The country whose price applies (ISO 3166-1 alpha-2), when known: the visitor's, or a dearer
+   * one they were seen in lately (Leverprice's VPN guard).
+   */
   country: string | null;
   /** `price` is the regional price of `country`. */
   regional: boolean;
@@ -204,6 +219,14 @@ interface Region {
   price: number;
 }
 
+interface Visitor {
+  key: CryptoKey;
+  userId: string | null;
+  state: AssignmentState;
+  /** The state differs from the request's cookie: send a new one. */
+  changed: boolean;
+}
+
 interface RequestScope {
   tail: Promise<unknown>;
   cookie: {
@@ -238,6 +261,9 @@ const SEND_ATTEMPTS = 3;
 const MAX_BACKOFF_MS = 30_000;
 const CATCH_UP_GAP_MS = 5_000;
 const MAX_DEDUPE = 10_000;
+const PRODUCTS_HEADER = "Leverprice-Products";
+const CONFIG_ERROR_HEADER = "Leverprice-Config-Error";
+const MAX_REPORTED_PRODUCTS = 50;
 const noop = () => {};
 
 export class Leverprice {
@@ -258,13 +284,16 @@ export class Leverprice {
   private readonly fetchImpl: FetchLike;
   private readonly onError: ((error: Error) => void) | undefined;
   private readonly trust: TrustChain;
+  private readonly productsHeader: string;
 
   private config: Config | null = null;
+  private configError: ConfigErrorCode | null = null;
   private signingKey: SigningKey | null = null;
   private etag: string | null = null;
   private fetchedAt = 0;
   private inflight: Promise<void> | null = null;
   private inflightStartedAt = 0;
+  private slowFlight: Promise<void> | null = null;
   private failures = 0;
   private retryAt = 0;
   private serverVersion = 0;
@@ -295,17 +324,28 @@ export class Leverprice {
     const countryHeader = typeof header === "string" ? header.replace(ASCII_SPACE_ENDS_RE, "") : null;
     if (countryHeader === null || (countryHeader !== "" && !HEADER_NAME_RE.test(countryHeader)))
       throw new Error("Leverprice: countryHeader is not a valid header name");
-    this.countryHeader = countryHeader === "" ? null : countryHeader.toLowerCase();
     this.localCurrencies = options.localCurrencies === true;
     this.flushIntervalMs = options.flushIntervalMs ?? 2_000;
     this.fetchImpl = options.fetch ?? ((url, init) => fetch(url, init));
     this.onError = options.onError;
     this.trust = new TrustChain(options.trustedRootKeys ?? ROOT_PUBLIC_KEYS, MIN_KEYSET_VERSION);
+    this.productsHeader = productsHeader(this.guards);
     const key = typeof options.secretKey === "string" ? options.secretKey.trim() : "";
     this.secretKey = KEY_RE.test(key) ? key : null;
-    if (key && !this.secretKey && !this.disabled && !envDisabled()) {
+    const quiet = this.disabled || envDisabled();
+    if (key && !this.secretKey && !quiet) {
       this.emit(
         new Error("Leverprice: secretKey is not a pp_sk_live_… / pp_sk_test_… key; serving fallback prices."),
+      );
+    }
+    const named = countryHeader === "" ? null : countryHeader.toLowerCase();
+    // A header the visitor sends would let them pick their own price: the project's setting is used.
+    this.countryHeader = named !== null && visitorSetHeader(named) ? null : named;
+    if (named !== null && this.countryHeader === null && !quiet) {
+      this.emit(
+        new Error(
+          `Leverprice: countryHeader "${named}" is sent by visitors' browsers, so it would let them pick their own price; it is ignored. Name the header your CDN or host sets, such as cf-ipcountry.`,
+        ),
       );
     }
   }
@@ -368,22 +408,37 @@ export class Leverprice {
       const product = config.products.get(productKey);
       if (!product) return fallbackQuote(productKey, guard, "unknown_product");
       if (product.currency !== guard.currency) return fallbackQuote(productKey, guard, "currency_mismatch");
-      const exp = experimentFor(product, req.country);
+      // The country a visitor holds lives in the cookie, so it is read before the test is chosen.
+      const held =
+        config.countryHold > 0 && product.regions.length > 0
+          ? await this.visitor(ctx, req, scope, config)
+          : null;
+      const country = held
+        ? this.heldCountry(held, guard, product, req.country, config.countryHold)
+        : req.country;
+      const exp = experimentFor(product, country);
       if (!exp) {
         if (!inRange(product, product.price)) return fallbackQuote(productKey, guard, "out_of_bounds");
-        const region = this.regionFor(guard, product, req.country);
-        return region
-          ? { ...regionalQuote(productKey, guard, region, "base_price"), country: req.country }
-          : {
-              ...priceQuote(productKey, guard, product.price, "base_price", product.checkoutUrl),
-              country: req.country,
-            };
+        const region = this.regionFor(guard, product, country);
+        const quote = region
+          ? { ...regionalQuote(productKey, guard, region, "base_price"), country }
+          : { ...priceQuote(productKey, guard, product.price, "base_price", product.checkoutUrl), country };
+        if (held) {
+          const cookies = await this.keep(held, scope, req, config);
+          // Outside a test the cookie only carries the held country: none held, none sent.
+          quote.setCookie = held.state.c !== undefined ? cookies : [];
+        }
+        return quote;
       }
       if (exp.variants.length === 0 || !exp.variants.every((v) => inRange(product, v.price))) {
         return fallbackQuote(productKey, guard, "out_of_bounds");
       }
-      const region = this.regionFor(guard, product, req.country);
-      return await this.experimentQuote(productKey, guard, ctx, req, scope, config, product, exp, region);
+      const visitor = held ?? (await this.visitor(ctx, req, scope, config));
+      const region = this.regionFor(guard, product, country);
+      return await this.experimentQuote(productKey, guard, ctx, req, scope, config, product, exp, region, {
+        country,
+        visitor,
+      });
     } catch (err) {
       this.report(err);
       return bot ? fallbackQuote(productKey, guard, "bot") : this.noConfig(productKey, guard, scope);
@@ -400,9 +455,64 @@ export class Leverprice {
     product: ConfigProduct,
     exp: ConfigExperiment,
     region: Region | null,
+    { country, visitor }: { country: string | null; visitor: Visitor },
   ): Promise<Quote> {
-    const key = await this.hmacKeyFor(config.assignmentKey);
+    const { key, userId, state } = visitor;
+    const visitorKey = userId !== null ? `u:${userId}` : `a:${state.v}`;
+    const visitorId = await hmacHex(key, `pp:visitor:v1:${visitorKey}`, 32);
 
+    const assigned = own(state.a, exp.id);
+    const sticky = assigned === undefined ? undefined : exp.variants.find((v) => v.id === assigned);
+    const variant =
+      sticky ??
+      pickVariant(
+        exp.variants,
+        await bucketFor(exp.salt, visitorId),
+        country === null ? undefined : exp.splitOf.get(country),
+      );
+    if (!sticky) {
+      assign(state, exp.id, variant.id);
+      visitor.changed = true;
+    }
+
+    let logged = state.x.includes(exp.id) || this.exposed.has(`${exp.id}:${visitorId}`);
+    if (!logged && (ctx.exposure ?? "auto") === "auto" && !req.prefetch) {
+      this.recordExposure(exp.id, variant.id, visitorId, country);
+      logged = true;
+    }
+    if (logged && markExposed(state, exp.id)) visitor.changed = true;
+
+    const setCookie = await this.keep(visitor, scope, req, config);
+    const signature = await hmacHex(key, `pp:attr:v1:${exp.id}:${variant.id}:${visitorId}`, 16);
+    return {
+      productKey,
+      price: region ? variant.regional[region.index]! : variant.price,
+      currency: region ? region.currency : guard.currency,
+      country,
+      regional: region !== null,
+      isFallback: false,
+      reason: "experiment",
+      experimentId: exp.id,
+      variantId: variant.id,
+      visitorId,
+      metadata: { pp_exp: exp.id, pp_var: variant.id, pp_vid: visitorId, pp_sig: signature },
+      setCookie,
+      checkoutUrl: region ? null : (variant.checkoutUrl ?? product.checkoutUrl ?? null),
+      exposureLogged: logged,
+    };
+  }
+
+  /**
+   * The visitor behind the request: the state an earlier quote of the same request left, else the
+   * first valid assignment cookie, else a new visitor.
+   */
+  private async visitor(
+    ctx: GetPriceContext,
+    req: RequestInfo,
+    scope: RequestScope | null,
+    config: Config,
+  ): Promise<Visitor> {
+    const key = await this.hmacKeyFor(config.assignmentKey);
     const userId = normalizeUserId(ctx.userId);
     const prior = scope?.cookie;
     let state: AssignmentState | null = null;
@@ -419,63 +529,79 @@ export class Leverprice {
         if (state) break;
       }
     }
-    let changed = false;
-    if (!state) {
-      state = newAssignmentState(randomHex(16));
-      changed = true;
+    if (state) return { key, userId, state, changed: false };
+    return { key, userId, state: newAssignmentState(await this.newVisitorKey(key, ctx, req)), changed: true };
+  }
+
+  /**
+   * A new visitor's key. Without a cookie a browser comes back as a new visitor every time, so the
+   * key comes from what stays the same between its requests (address, browser, languages), keyed by
+   * the project's secret: a visitor who refuses cookies keeps one price and counts once. Neither the
+   * address nor the browser leaves the server. Without an address, a random key.
+   */
+  private async newVisitorKey(key: CryptoKey, ctx: GetPriceContext, req: RequestInfo): Promise<string> {
+    const address = clientAddress(ctx.request);
+    if (address === null) return randomHex(16);
+    const language = readHeader(ctx.request, "accept-language") ?? "";
+    return hmacHex(key, `pp:anon:v1:${address}\n${req.userAgent ?? ""}\n${language}`, 32);
+  }
+
+  /**
+   * The country whose price the visitor gets (Leverprice's VPN guard). A visitor seen lately in a
+   * country that pays more keeps that country's price, so switching a VPN to a cheaper country
+   * changes nothing until the hold runs out. Anywhere else, the visitor is priced where they are and
+   * that country is held from now on.
+   */
+  private heldCountry(
+    visitor: Visitor,
+    guard: Guard,
+    product: ConfigProduct,
+    country: string | null,
+    holdSeconds: number,
+  ): string | null {
+    const now = Math.floor(Date.now() / 1000);
+    const { state } = visitor;
+    const held =
+      state.c !== undefined && state.t !== undefined && now - state.t < holdSeconds ? state.c : null;
+    if (
+      held !== null &&
+      held !== country &&
+      this.levelOf(guard, product, held) > this.levelOf(guard, product, country)
+    ) {
+      return held;
     }
-
-    const visitorKey = userId !== null ? `u:${userId}` : `a:${state.v}`;
-    const visitorId = await hmacHex(key, `pp:visitor:v1:${visitorKey}`, 32);
-
-    const assigned = own(state.a, exp.id);
-    const sticky = assigned === undefined ? undefined : exp.variants.find((v) => v.id === assigned);
-    const variant =
-      sticky ??
-      pickVariant(
-        exp.variants,
-        await bucketFor(exp.salt, visitorId),
-        req.country === null ? undefined : exp.splitOf.get(req.country),
-      );
-    if (!sticky) {
-      assign(state, exp.id, variant.id);
-      changed = true;
+    if (country !== null && held !== country) {
+      state.c = country;
+      state.t = now;
+      visitor.changed = true;
     }
+    return country;
+  }
 
-    let logged = state.x.includes(exp.id) || this.exposed.has(`${exp.id}:${visitorId}`);
-    if (!logged && (ctx.exposure ?? "auto") === "auto" && !req.prefetch) {
-      this.recordExposure(exp.id, variant.id, visitorId, req.country);
-      logged = true;
+  /** What a visitor from `country` pays, as basis points of the standard price. */
+  private levelOf(guard: Guard, product: ConfigProduct, country: string | null): number {
+    const region = this.regionFor(guard, product, country);
+    return region ? (product.regions[region.index] as ConfigRegion).level : STANDARD_LEVEL;
+  }
+
+  /** Remembers the visitor for the request's next quote; the Set-Cookie values when it changed. */
+  private async keep(
+    visitor: Visitor,
+    scope: RequestScope | null,
+    req: RequestInfo,
+    config: Config,
+  ): Promise<string[]> {
+    if (scope) {
+      scope.cookie = {
+        input: req.cookieInput,
+        userId: visitor.userId,
+        assignmentKey: config.assignmentKey,
+        state: visitor.state,
+      };
     }
-    if (logged && markExposed(state, exp.id)) changed = true;
-
-    if (scope) scope.cookie = { input: req.cookieInput, userId, assignmentKey: config.assignmentKey, state };
-    const signature = await hmacHex(key, `pp:attr:v1:${exp.id}:${variant.id}:${visitorId}`, 16);
-    return {
-      productKey,
-      price: region ? variant.regional[region.index]! : variant.price,
-      currency: region ? region.currency : guard.currency,
-      country: req.country,
-      regional: region !== null,
-      isFallback: false,
-      reason: "experiment",
-      experimentId: exp.id,
-      variantId: variant.id,
-      visitorId,
-      metadata: { pp_exp: exp.id, pp_var: variant.id, pp_vid: visitorId, pp_sig: signature },
-      setCookie: changed
-        ? [
-            setCookieHeader(
-              this.cookieName,
-              await signAssignment(key, state),
-              this.cookieMaxAge,
-              this.cookieAttrs,
-            ),
-          ]
-        : [],
-      checkoutUrl: region ? null : (variant.checkoutUrl ?? product.checkoutUrl ?? null),
-      exposureLogged: logged,
-    };
+    if (!visitor.changed) return [];
+    const value = await signAssignment(visitor.key, visitor.state);
+    return [setCookieHeader(this.cookieName, value, this.cookieMaxAge, this.cookieAttrs)];
   }
 
   /**
@@ -618,9 +744,20 @@ export class Leverprice {
     if (ready) return ready;
     const flight = this.liveFlight(now);
     if (!flight) return null;
-    const remaining = this.timeoutMs - (now - this.inflightStartedAt);
-    if (remaining > 0) await waitAtMost(flight, remaining);
-    return this.usable(Date.now());
+    // Each request waits its own timeoutMs: a fetch started earlier (preload(), another request)
+    // must not shorten it.
+    if (this.timeoutMs <= 0) return this.usable(Date.now());
+    await waitAtMost(flight, this.timeoutMs);
+    const config = this.usable(Date.now());
+    if (!config && this.inflight === flight && this.slowFlight !== flight) {
+      this.slowFlight = flight;
+      this.report(
+        new Error(
+          `Leverprice config: still loading after ${this.timeoutMs} ms (timeoutMs); serving fallback prices until it arrives`,
+        ),
+      );
+    }
+    return config;
   }
 
   private kick(now: number): void {
@@ -652,7 +789,10 @@ export class Leverprice {
 
   private async loadConfig(unconditional: boolean): Promise<void> {
     try {
-      const headers: Record<string, string> = {};
+      // Tells the dashboard whether visitors get real prices: the products in code, and why the
+      // last config was refused.
+      const headers: Record<string, string> = { [PRODUCTS_HEADER]: this.productsHeader };
+      if (this.configError) headers[CONFIG_ERROR_HEADER] = this.configError;
       if (!unconditional && this.etag && this.usable(Date.now())) headers["If-None-Match"] = this.etag;
       const res = await this.request("/v1/config", "GET", headers);
       if (res.status === 304 && headers["If-None-Match"]) {
@@ -663,9 +803,10 @@ export class Leverprice {
         try {
           envelope = JSON.parse(res.body);
         } catch {
-          throw new Error("Leverprice config: response is not JSON");
+          throw new ConfigError("malformed", "Leverprice config: response is not JSON");
         }
         await this.accept(envelope);
+        this.configError = null;
         this.etag = res.headers.get("ETag");
         this.fetchedAt = Date.now();
       }
@@ -673,6 +814,7 @@ export class Leverprice {
       this.retryAt = 0;
       this.noteServerVersion(res.headers);
     } catch (err) {
+      if (err instanceof ConfigError) this.configError = err.code;
       this.failures++;
       this.retryAt = Date.now() + Math.min(MAX_BACKOFF_MS, 500 * 2 ** this.failures);
       this.report(err);
@@ -690,16 +832,18 @@ export class Leverprice {
     const { config, signingKey, dropped } = await this.trust.verify(envelope, Date.now());
     // A validly signed config issued for other keys is refused even on the first load.
     if (!config.keyFingerprints.includes(await this.keyFingerprint())) {
-      throw new Error("Leverprice config: not issued for this API key; refusing");
+      throw new ConfigError("wrong_key", "Leverprice config: not issued for this API key; refusing");
     }
     const current = this.config;
     if (current && config.projectId !== current.projectId) {
-      throw new Error(
+      throw new ConfigError(
+        "wrong_project",
         `Leverprice config: project changed from ${current.projectId} to ${config.projectId}; refusing`,
       );
     }
     if (current && config.version < current.version) {
-      throw new Error(
+      throw new ConfigError(
+        "rollback",
         `Leverprice config: refusing to roll back from version ${current.version} to ${config.version}`,
       );
     }
@@ -902,6 +1046,28 @@ function envDisabled(): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * `Leverprice-Products`: `key=currency` per product, by key, keys percent-encoded (everything but
+ * `A–Z a–z 0–9 - . _ ~`, byte by byte in UTF-8), at most 50.
+ */
+function productsHeader(guards: Map<string, Guard>): string {
+  return [...guards]
+    .map(([key, guard]) => [encodeKey(key), guard.currency] as const)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .slice(0, MAX_REPORTED_PRODUCTS)
+    .map(([key, currency]) => `${key}=${currency}`)
+    .join(", ");
+}
+
+function encodeKey(key: string): string {
+  let out = "";
+  for (const byte of utf8(key)) {
+    const ch = String.fromCharCode(byte);
+    out += /^[A-Za-z0-9._~-]$/.test(ch) ? ch : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return out;
 }
 
 function normalizeGuards(products: Record<string, ProductGuard>): Map<string, Guard> {

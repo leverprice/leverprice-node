@@ -134,7 +134,8 @@ describe("parseConfig", () => {
     ]);
     expect(config.products.get("flat")).toMatchObject({ regions: [], regionOf: new Map() });
     const geo = config.products.get("geo")!;
-    expect(geo.regions[1]).toEqual({ countries: ["IN"], currency: "inr", price: 99_900 });
+    // No level in the config: it compares as the standard price, so it never holds a price.
+    expect(geo.regions[1]).toEqual({ countries: ["IN"], currency: "inr", price: 99_900, level: 10_000 });
     expect([...geo.regionOf]).toEqual([
       ["BR", 0],
       ["MX", 0],

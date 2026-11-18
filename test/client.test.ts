@@ -107,6 +107,32 @@ describe("configuration errors", () => {
     expect(() => new Leverprice({ secretKey, products, cookieName: "bad name;" })).toThrow(/cookieName/);
   });
 
+  it("ignores a countryHeader that visitors' browsers send, and says so once", async () => {
+    for (const countryHeader of [
+      "Accept-Language",
+      "x-forwarded-for",
+      "X-Real-IP",
+      "sec-ch-ua",
+      "user-agent",
+    ]) {
+      const onError = vi.fn();
+      const { fetch } = api();
+      const pp = make({ countryHeader, onError, fetch });
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(String(onError.mock.calls[0]?.[0])).toMatch(/sent by visitors' browsers.*ignored/);
+      const q = await pp.getPrice("pro", { request: { headers: { [countryHeader]: "IN" } } });
+      expect(q.country).toBeNull();
+    }
+    for (const countryHeader of ["cf-ipcountry", "x-vercel-ip-country", "x-geo-country"]) {
+      const onError = vi.fn();
+      make({ countryHeader, onError });
+      expect(onError).not.toHaveBeenCalled();
+    }
+    const onError = vi.fn();
+    make({ countryHeader: "accept-language", onError, disabled: true });
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it("validates countryHeader before changing its case", () => {
     for (const countryHeader of ["bad name", "x:y", "\u212aey", "\u00a0cf-ipcountry", "cf-ipcountry\u2003"])
       expect(() => make({ countryHeader })).toThrow(/countryHeader/);
@@ -313,5 +339,44 @@ describe("work stalled by a torn-down request", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("what the client tells the server", () => {
+  it("names its products on every config request, keys encoded and in order", async () => {
+    const { fetch, sent } = api();
+    const pp = new Leverprice({
+      secretKey,
+      products: {
+        team: { currency: "EUR", fallbackPrice: 4900 },
+        "pro plan": { currency: "usd", fallbackPrice: 1900 },
+        "\u00e9t\u00e9": { currency: "usd", fallbackPrice: 900 },
+      },
+      fetch,
+      onError: () => {},
+    });
+    await pp.refresh();
+    await pp.refresh();
+    const configs = sent.filter((r) => r.url.endsWith("/v1/config"));
+    expect(configs.length).toBeGreaterThanOrEqual(2);
+    for (const r of configs) {
+      expect(r.headers["Leverprice-Products"]).toBe("%C3%A9t%C3%A9=usd, pro%20plan=usd, team=eur");
+      expect(r.headers["Leverprice-Config-Error"]).toBeUndefined(); // an outage is not a refused config
+    }
+  });
+
+  it("says why it refused the last config until one is accepted", async () => {
+    const sent: Record<string, string>[] = [];
+    const bodies = ["not json", JSON.stringify({ payload: "x" })];
+    const fetch = vi.fn<FetchLike>(async (_url, init) => {
+      sent.push(init.headers);
+      return new Response(bodies.shift() ?? "{}", { status: 200 });
+    });
+    const pp = make({ fetch });
+    await pp.refresh();
+    await pp.refresh();
+    await pp.refresh();
+    expect(sent.map((h) => h["Leverprice-Config-Error"] ?? null)).toEqual([null, "malformed", "malformed"]);
+    expect(sent.every((h) => h["Leverprice-Products"] === "pro=usd")).toBe(true);
   });
 });

@@ -1,5 +1,5 @@
 import { ed25519Verify, fromB64url, fromUtf8, isRecord, own } from "./util.ts";
-import { type Config, type Keyset, parseConfig } from "./wire.ts";
+import { type Config, ConfigError, type ConfigErrorCode, type Keyset, parseConfig } from "./wire.ts";
 
 export const ROOT_KEY_PLACEHOLDER = "REPLACE_WITH_ROOT_PUBLIC_KEY";
 
@@ -32,21 +32,27 @@ export class TrustChain {
   }
 
   async verify(envelope: unknown, now: number): Promise<VerifiedConfig> {
-    if (!isRecord(envelope)) throw new Error("Leverprice config: response is not a signed config");
+    if (!isRecord(envelope))
+      throw new ConfigError("malformed", "Leverprice config: response is not a signed config");
     const { payload, signature, keyId } = envelope;
     if (typeof payload !== "string" || typeof signature !== "string" || typeof keyId !== "string") {
-      throw new Error("Leverprice config: response is not a signed config");
+      throw new ConfigError("malformed", "Leverprice config: response is not a signed config");
     }
-    const keyset = await this.verifyKeyset(envelope.keyset, now);
+    const keyset = await coded("untrusted", () => this.verifyKeyset(envelope.keyset, now));
     const key = keyset.keys.find((k) => k.id === keyId);
-    if (!key)
-      throw new Error(`Leverprice config: signing key "${keyId}" is not in keyset v${keyset.version}`);
-    if (!(await ed25519Verify(key.publicKey, signature, payload))) {
-      throw new Error(`Leverprice config: bad signature (key "${keyId}")`);
+    if (!key) {
+      throw new ConfigError(
+        "bad_signature",
+        `Leverprice config: signing key "${keyId}" is not in keyset v${keyset.version}`,
+      );
     }
-    const { config, dropped } = parseConfig(payload);
+    if (!(await ed25519Verify(key.publicKey, signature, payload))) {
+      throw new ConfigError("bad_signature", `Leverprice config: bad signature (key "${keyId}")`);
+    }
+    const { config, dropped } = await coded("malformed", async () => parseConfig(payload));
     if (now >= config.expiresAt) {
-      throw new Error(
+      throw new ConfigError(
+        "expired",
         `Leverprice config v${config.version}: expired at ${new Date(config.expiresAt).toISOString()}`,
       );
     }
@@ -120,4 +126,14 @@ function parseKeyset(payload: string): Keyset {
     expiresAt: typeof raw.expiresAt === "number" ? raw.expiresAt : null,
     keys,
   };
+}
+
+async function coded<T>(code: ConfigErrorCode, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    throw err instanceof ConfigError
+      ? err
+      : new ConfigError(code, err instanceof Error ? err.message : String(err));
+  }
 }

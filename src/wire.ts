@@ -1,6 +1,26 @@
+import { visitorSetHeader } from "./request.ts";
 import { fromB64url, fromUtf8, isRecord } from "./util.ts";
 
 export const PROTOCOL_VERSION = 2;
+
+/** Why a config was refused, as sent to the server in `Leverprice-Config-Error`. */
+export type ConfigErrorCode =
+  | "untrusted"
+  | "bad_signature"
+  | "expired"
+  | "wrong_key"
+  | "wrong_project"
+  | "rollback"
+  | "malformed";
+
+export class ConfigError extends Error {
+  constructor(
+    readonly code: ConfigErrorCode,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 export const CONFIG_VERSION_HEADER = "Leverprice-Config-Version";
 export const MAX_EVENTS_PER_REQUEST = 500;
 export const PROVIDERS = ["stripe", "polar", "lemonsqueezy", "dodo", "paddle", "creem", "other"] as const;
@@ -40,6 +60,8 @@ export interface ConfigRegion {
   countries: string[];
   currency: string;
   price: number;
+  /** The price as basis points of the standard price (10000 = the same), to compare countries. */
+  level: number;
 }
 
 export interface ConfigExperiment {
@@ -74,8 +96,14 @@ export interface Config {
   keyFingerprints: string[];
   /** Lowercase header that carries the visitor's country, from the project's settings. */
   countryHeader: string | null;
+  /** Seconds a visitor keeps the price of a dearer country they were seen in. 0: off. */
+  countryHold: number;
   products: Map<string, ConfigProduct>;
 }
+
+/** The level of a country without a regional price: the standard price. */
+export const STANDARD_LEVEL = 10_000;
+export const MAX_COUNTRY_HOLD = 90 * 86_400;
 
 export const MAX_REGIONS = 300;
 export const MAX_SPLITS = 300;
@@ -102,8 +130,17 @@ export function parseConfig(payload: string): { config: Config; dropped: string[
       `Leverprice config: unsupported schema ${String(raw.schema)} (this SDK speaks schema ${PROTOCOL_VERSION})`,
     );
   }
-  const { projectId, version, issuedAt, expiresAt, assignmentKey, keyFingerprints, countryHeader, products } =
-    raw;
+  const {
+    projectId,
+    version,
+    issuedAt,
+    expiresAt,
+    assignmentKey,
+    keyFingerprints,
+    countryHeader,
+    countryHold,
+    products,
+  } = raw;
   if (
     !Array.isArray(keyFingerprints) ||
     !keyFingerprints.every((f) => typeof f === "string" && /^[0-9a-f]{16}$/.test(f))
@@ -138,9 +175,17 @@ export function parseConfig(payload: string): { config: Config; dropped: string[
       assignmentKey,
       keyFingerprints: keyFingerprints as string[],
       countryHeader:
-        typeof countryHeader === "string" && HEADER_NAME_RE.test(countryHeader)
+        typeof countryHeader === "string" &&
+        HEADER_NAME_RE.test(countryHeader) &&
+        !visitorSetHeader(countryHeader)
           ? countryHeader.toLowerCase()
           : null,
+      countryHold:
+        Number.isSafeInteger(countryHold) &&
+        (countryHold as number) > 0 &&
+        (countryHold as number) <= MAX_COUNTRY_HOLD
+          ? (countryHold as number)
+          : 0,
       products: out,
     },
     dropped,
@@ -249,7 +294,15 @@ function parseRegions(raw: unknown): ConfigRegion[] | null {
     if (!isRecord(r) || !Array.isArray(r.countries) || r.countries.length === 0) return null;
     if (!r.countries.every((c) => typeof c === "string" && COUNTRY_RE.test(c))) return null;
     if (typeof r.currency !== "string" || !/^[A-Za-z]{3}$/.test(r.currency) || !isPrice(r.price)) return null;
-    regions.push({ countries: r.countries as string[], currency: r.currency.toLowerCase(), price: r.price });
+    // A level this SDK can't read compares as the standard price: it never holds a price.
+    const level =
+      Number.isSafeInteger(r.level) && (r.level as number) > 0 ? (r.level as number) : STANDARD_LEVEL;
+    regions.push({
+      countries: r.countries as string[],
+      currency: r.currency.toLowerCase(),
+      price: r.price,
+      level,
+    });
   }
   return regions;
 }

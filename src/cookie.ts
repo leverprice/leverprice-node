@@ -3,12 +3,16 @@ import { b64url, fromB64url, fromUtf8, hmac, isRecord, timingSafeEqual, utf8 } f
 export const MAX_COOKIE_EXPERIMENTS = 10;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const VISITOR_KEY_RE = /^[0-9a-f]{32}$/;
+const COUNTRY_RE = /^[A-Z]{2}$/;
 const MAX_COOKIE_LENGTH = 4096;
 
 export interface AssignmentState {
   v: string;
   a: Record<string, string>;
   x: string[];
+  /** The country whose price the visitor holds, and since when (seconds since the epoch). */
+  c?: string;
+  t?: number;
 }
 
 export interface CookieAttributes {
@@ -21,7 +25,7 @@ export function newAssignmentState(v: string): AssignmentState {
 }
 
 export function cloneState(s: AssignmentState): AssignmentState {
-  return { v: s.v, a: { ...s.a }, x: [...s.x] };
+  return { v: s.v, a: { ...s.a }, x: [...s.x], ...(s.c !== undefined ? { c: s.c, t: s.t } : {}) };
 }
 
 export function assign(state: AssignmentState, experimentId: string, variantId: string): void {
@@ -39,7 +43,8 @@ export function markExposed(state: AssignmentState, experimentId: string): boole
 }
 
 export async function signAssignment(key: CryptoKey, state: AssignmentState): Promise<string> {
-  const body = b64url(utf8(JSON.stringify({ v: state.v, a: state.a, x: state.x })));
+  const held = state.c !== undefined && state.t !== undefined ? { c: state.c, t: state.t } : {};
+  const body = b64url(utf8(JSON.stringify({ v: state.v, a: state.a, x: state.x, ...held })));
   const sig = b64url((await hmac(key, `pp:cookie:v1:${body}`)).slice(0, 16));
   return `${body}.${sig}`;
 }
@@ -72,7 +77,14 @@ function normalizeState(raw: unknown): AssignmentState | null {
         .filter((id): id is string => typeof id === "string" && Object.hasOwn(a, id))
         .slice(0, MAX_COOKIE_EXPERIMENTS)
     : [];
-  return { v: raw.v, a, x };
+  const held =
+    typeof raw.c === "string" &&
+    COUNTRY_RE.test(raw.c) &&
+    Number.isSafeInteger(raw.t) &&
+    (raw.t as number) >= 0
+      ? { c: raw.c, t: raw.t as number }
+      : {};
+  return { v: raw.v, a, x, ...held };
 }
 
 export function setCookieHeader(
