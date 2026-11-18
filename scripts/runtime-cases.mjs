@@ -1,11 +1,15 @@
 /** Runtime-agnostic checks of a built SDK against the conformance vectors (no node: imports). */
 const GUARDS = {
-  pro: { currency: "usd", fallbackPrice: 1900, minPrice: 1500, maxPrice: 3900 },
+  pro: { currency: "usd", fallbackPrice: 1900 },
   basic: { currency: "usd", fallbackPrice: 1000 },
-  euro: { currency: "eur", fallbackPrice: 1200, minPrice: 100, maxPrice: 5000 },
-  wild: { currency: "usd", fallbackPrice: 2000, minPrice: 1000, maxPrice: 3000 },
+  euro: { currency: "eur", fallbackPrice: 1200 },
+  wild: { currency: "usd", fallbackPrice: 2000 },
   bad: { currency: "usd", fallbackPrice: 150 },
   ghost: { currency: "usd", fallbackPrice: 4900 },
+  geo: { currency: "usd", fallbackPrice: 2900 },
+  geox: { currency: "usd", fallbackPrice: 2900 },
+  badgeo: { currency: "usd", fallbackPrice: 2900 },
+  badgeox: { currency: "usd", fallbackPrice: 2900 },
 };
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -33,12 +37,15 @@ export async function runCases(sdk, V) {
       trustedRootKeys: V.rootKeys,
       fetch,
       onError: () => {},
+      ...(q.countryHeader ? { countryHeader: q.countryHeader } : {}),
+      ...(typeof q.localCurrencies === "boolean" ? { localCurrencies: q.localCurrencies } : {}),
     });
     const quote = await lp.getPrice(q.productKey, {
       request: { headers: q.headers },
       userId: q.userId,
       ...(q.exposure ? { exposure: q.exposure } : {}),
       ...(typeof q.bot === "boolean" ? { bot: q.bot } : {}),
+      ...(q.country !== undefined ? { country: q.country } : {}),
     });
     await lp.flush();
     const exposures = sent.flatMap((b) => b.events).map(({ timestamp, ...rest }) => rest);

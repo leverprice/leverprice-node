@@ -66,10 +66,14 @@ export async function bucketFor(salt: string, visitorId: string): Promise<number
   return (((h[0]! << 24) | (h[1]! << 16) | (h[2]! << 8) | h[3]!) >>> 0) % 10_000;
 }
 
-export function pickVariant<V extends { weight: number }>(variants: V[], bucket: number): V {
+export function pickVariant<V extends { weight: number }>(
+  variants: V[],
+  bucket: number,
+  weights?: readonly number[],
+): V {
   let acc = 0;
-  for (const v of variants) {
-    acc += v.weight;
+  for (const [i, v] of variants.entries()) {
+    acc += weights ? (weights[i] ?? 0) : v.weight;
     if (bucket < acc) return v;
   }
   return variants[variants.length - 1]!;

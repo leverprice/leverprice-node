@@ -13,7 +13,7 @@ import {
   verifyAssignment,
 } from "../src/cookie.ts";
 import { type FetchLike, Leverprice, type ProductGuard } from "../src/index.ts";
-import { cookieValues, isPrefetch } from "../src/request.ts";
+import { cookieValues, isPrefetch, normalizeCountry } from "../src/request.ts";
 import { bucketFor, fromB64url, hex, hmacHex, hmacKey, pickVariant, utf8 } from "../src/util.ts";
 import { eventProblem, type WireEvent } from "../src/wire.ts";
 
@@ -43,12 +43,16 @@ const fromState = (s: AssignmentState | null): VState | null =>
 const key = () => hmacKey(fromB64url(V.assignmentKey));
 
 const DEFAULT_GUARDS: Record<string, ProductGuard> = {
-  pro: { currency: "usd", fallbackPrice: 1900, minPrice: 1500, maxPrice: 3900 },
+  pro: { currency: "usd", fallbackPrice: 1900 },
   basic: { currency: "usd", fallbackPrice: 1000 },
-  euro: { currency: "eur", fallbackPrice: 1200, minPrice: 100, maxPrice: 5000 },
-  wild: { currency: "usd", fallbackPrice: 2000, minPrice: 1000, maxPrice: 3000 },
+  euro: { currency: "eur", fallbackPrice: 1200 },
+  wild: { currency: "usd", fallbackPrice: 2000 },
   bad: { currency: "usd", fallbackPrice: 150 },
   ghost: { currency: "usd", fallbackPrice: 4900 },
+  geo: { currency: "usd", fallbackPrice: 2900 },
+  geox: { currency: "usd", fallbackPrice: 2900 },
+  badgeo: { currency: "usd", fallbackPrice: 2900 },
+  badgeox: { currency: "usd", fallbackPrice: 2900 },
 };
 
 afterEach(() => {
@@ -148,6 +152,10 @@ describe("conformance: primitives", () => {
     }
   });
 
+  it("normalises countries", () => {
+    for (const c of V.countries) expect(normalizeCountry(c.value), JSON.stringify(c.value)).toBe(c.country);
+  });
+
   it("detects bots", () => {
     for (const b of V.bots) expect(isBot(b.userAgent), b.userAgent).toBe(b.bot);
   });
@@ -176,16 +184,19 @@ describe("conformance: quotes", () => {
         trustedRootKeys: V.rootKeys,
         fetch,
         onError: (e) => errors.push(e.message),
+        ...(q.countryHeader ? { countryHeader: q.countryHeader } : {}),
+        ...(typeof q.localCurrencies === "boolean" ? { localCurrencies: q.localCurrencies } : {}),
       });
       const quote = await lp.getPrice(q.productKey, {
         request: { headers: q.headers },
         userId: q.userId,
         ...(q.exposure ? { exposure: q.exposure } : {}),
         ...(typeof q.bot === "boolean" ? { bot: q.bot } : {}),
+        ...(typeof q.country === "string" ? { country: q.country } : {}),
       });
       await lp.flush();
       const exposures = sent.flatMap((b) => b.events).map(({ timestamp: _t, ...rest }) => rest);
       expect({ ...quote, productKey: undefined, exposures }).toEqual({ ...q.expect, productKey: undefined });
-      expect(errors.filter((e) => !e.includes("malformed products"))).toEqual([]);
+      expect(errors.filter((e) => !e.includes("malformed products"))).toEqual(q.errors);
     });
 });

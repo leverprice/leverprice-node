@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { type FetchLike, Leverprice, type LeverpriceOptions } from "../src/index.ts";
 
 const secretKey = `pp_sk_test_${"a1B2c3D4e5".repeat(4)}`;
-const products = { pro: { currency: "USD", fallbackPrice: 1900, minPrice: 1500, maxPrice: 3900 } };
+const products = { pro: { currency: "USD", fallbackPrice: 1900 } };
 
 interface Sent {
   url: string;
@@ -102,8 +102,19 @@ describe("configuration errors", () => {
     expect(bad({ currency: "usd", fallbackPrice: 0 })).toThrow(/fallbackPrice/);
     expect(bad({ currency: "usd", fallbackPrice: 19.5 })).toThrow(/fallbackPrice/);
     expect(bad({ currency: "dollars", fallbackPrice: 1900 })).toThrow(/currency/);
-    expect(bad({ currency: "usd", fallbackPrice: 1900, minPrice: 10, maxPrice: 5 })).toThrow(/minPrice/);
+    expect(bad({ currency: "usd", fallbackPrice: 1900, minPrice: 10, maxPrice: 5 })).not.toThrow();
+    expect(bad({ currency: "usd", fallbackPrice: 1900, minPrice: "19", maxPrice: null })).not.toThrow();
     expect(() => new Leverprice({ secretKey, products, cookieName: "bad name;" })).toThrow(/cookieName/);
+  });
+
+  it("validates countryHeader before changing its case", () => {
+    for (const countryHeader of ["bad name", "x:y", "\u212aey", "\u00a0cf-ipcountry", "cf-ipcountry\u2003"])
+      expect(() => make({ countryHeader })).toThrow(/countryHeader/);
+    for (const countryHeader of [5, ["cf-ipcountry"], {}])
+      expect(() => make({ countryHeader: countryHeader as never })).toThrow(/countryHeader is not a valid/);
+    expect(() => make({ countryHeader: null as never })).not.toThrow();
+    for (const countryHeader of ["CF-IPCountry", " cf-ipcountry\n", "", "  "])
+      expect(() => make({ countryHeader })).not.toThrow();
   });
 });
 
@@ -188,6 +199,25 @@ describe("events", () => {
     expect(onError).toHaveBeenCalledTimes(5);
     expect(events().flatMap((r) => r.body?.events ?? [])).toEqual([
       expect.objectContaining({ type: "refund", orderId: "pi_ok", refundedTotal: 500 }),
+    ]);
+  });
+
+  it("logs a manual exposure with the quote's country, or without one when it is not a country", async () => {
+    const { fetch, events } = api();
+    const pp = make({ fetch });
+    const quote = (visitorId: string, country: unknown) =>
+      ({ reason: "experiment", experimentId: "exp_1", variantId: "var_1", visitorId, country }) as never;
+    expect(pp.logExposure(quote("v1", " br "))).toBe(true);
+    expect(pp.logExposure(quote("v2", "ß"))).toBe(true);
+    expect(pp.logExposure(quote("v3", 42))).toBe(true);
+    expect(pp.logExposure(quote("v4", undefined))).toBe(true);
+    await pp.flush();
+    const sent = events().flatMap((r) => r.body?.events ?? []);
+    expect(sent.map((e) => [e.visitorId, e.country])).toEqual([
+      ["v1", "BR"],
+      ["v2", undefined],
+      ["v3", undefined],
+      ["v4", undefined],
     ]);
   });
 

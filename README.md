@@ -31,8 +31,7 @@ import { Leverprice } from "@leverprice/sdk"; // or: const { Leverprice } = requ
 export const leverprice = new Leverprice({
   secretKey: process.env.LEVERPRICE_SECRET_KEY, // server-only, never in the browser
   products: {
-    // Local guardrails: prices outside these bounds are never returned.
-    pro: { currency: "usd", fallbackPrice: 1900, minPrice: 1500, maxPrice: 3900 },
+    pro: { currency: "usd", fallbackPrice: 1900 }, // your current price, served whenever Leverprice cannot answer
   },
 });
 leverprice.preload(); // optional, long-lived servers: fetch the config at startup, not on the first request
@@ -53,20 +52,33 @@ await stripe.checkout.sessions.create({
 });
 
 // 3. In your webhook handler (or connect your provider's webhooks to Leverprice directly).
-await leverprice.trackPurchase({
-  provider: "stripe",
-  orderId: session.payment_intent,
-  amount: session.amount_total - (session.total_details?.amount_tax ?? 0),
-  currency: session.currency,
-  metadata: session.metadata,
-});
+//    A session paid with a delayed method completes "unpaid"; async_payment_succeeded reports it later.
+const event = stripe.webhooks.constructEvent(rawBody, signature, endpointSecret); // rawBody: the body as received
+if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
+  const session = event.data.object;
+  // $0 sessions (a trial start, a 100% discount) are not sales.
+  if (session.payment_status === "paid" && session.payment_intent && session.amount_total > 0) {
+    await leverprice.trackPurchase({
+      provider: "stripe",
+      orderId: session.payment_intent,
+      amount: session.amount_total - (session.total_details?.amount_tax ?? 0),
+      currency: session.currency,
+      metadata: session.metadata,
+      timestamp: event.created, // Unix seconds are converted
+    });
+  }
+}
 ```
+
+A subscription session names the PaymentIntent of its first payment from Stripe API version 2025-03-31.basil on. On an older version, report that payment from `invoice.paid` with `billing_reason` `subscription_create`: the order id is the invoice's `payment_intent` and the attribution is in `subscription_details.metadata`, so pass `subscription_data: { metadata: q.metadata }` at checkout as well.
+
+That is all the configuration your code holds. Prices, price ranges, tests, regional prices and where the visitor's country comes from are managed in Leverprice and arrive in a signed config, so new features and new settings never need a code change.
 
 ## Guarantees
 
 - **Fails safe.** If Leverprice is off, slow (no config within 500 ms), down, misconfigured or returns anything unexpected, `getPrice()` returns your `fallbackPrice`. It never throws for those reasons.
 - **Verified config.** Root key → keyset → config signature chain, version-monotonic (no rollback, no revoked keys), time-limited.
-- **Bounded.** Every price is checked against your local `minPrice`/`maxPrice` and `currency`.
+- **Bounded.** Every standard and test price is checked against the product's signed price range and currency; regional prices follow from them, and every country pays between 5% and 200% of the standard price.
 - **Sticky and tamper-proof.** Visitors keep their price. The assignment cookie is HMAC-signed with your project's assignment key (delivered in the signed config), so rotating your API key does not reshuffle visitors.
 - **Private.** Visitor and user ids are HMAC-hashed on your server; Leverprice only sees the hash.
 - **No price flips.** A visitor who got the fallback during an outage keeps it for the rest of their session.
@@ -93,7 +105,7 @@ const quote = await leverprice.getPrice("pro", { request: event.node.req });
 for (const c of quote.setCookie) appendResponseHeader(event, "Set-Cookie", c);
 ```
 
-React Server Components can read cookies but cannot set them. Price new visitors where a response can carry `Set-Cookie` (a route handler, a server action, or middleware/`proxy.ts`), or pass `cookie` and `userAgent` from `headers()` for visitors who already have the cookie.
+React Server Components can read cookies but cannot set them. Price new visitors where a response can carry `Set-Cookie` (a route handler, a server action, or middleware/`proxy.ts`), or pass `cookie` and `userAgent` from `headers()` for visitors who already have the cookie. With regional prices, pass `country` there too: the SDK reads the country header only from a `request`.
 
 On Cloudflare Workers and other edge runtimes, create the client once per isolate (module scope) and pass `ctx.waitUntil(leverprice.flush())` so exposures are sent after the response.
 
@@ -105,9 +117,27 @@ Pass the incoming `request` (Fetch `Request`, or Node `IncomingMessage` / any `{
 
 Pricing several products for one page? Pass the **same `request` object** to each `getPrice()` call: the quotes share one visitor cookie, and the last quote's cookie carries every assignment.
 
+## Regional prices
+
+Turn on regional prices for a product in the dashboard and a visitor from India pays $12, or ₹999 in rupees, where a visitor from the US pays $29. Your code stays as it is: in Leverprice, choose where your site runs under **Project settings → Visitor country** (Cloudflare, Vercel, AWS CloudFront, or the header your own proxy sets), and the SDK reads the visitor's country from that header.
+
+```ts
+const quote = await leverprice.getPrice("pro", { request }); // a visitor from India
+quote.price; //    1200: India is set to $12 in the dashboard
+quote.currency; // "usd": pass both to your checkout
+quote.country; //  "IN"
+quote.regional; // true
+```
+
+- **The country.** Name only a header your host or CDN sets and overwrites: a header a visitor can send themselves would let them pick their own price. To decide in code instead, pass `countryHeader` to the constructor (it replaces the project setting) or `country` to `getPrice()` (it wins over both).
+- **Local currencies.** Regional prices in your product's currency ($12 in India instead of $29) need nothing in code. Prices in the visitor's own currency (₹999) are served only with `localCurrencies: true`, which you set when your checkout charges `quote.price` in `quote.currency`; without it those visitors get the standard price, so a checkout with a fixed currency can never charge 99900 in dollars.
+- **Tests.** Each visitor still gets one sticky variant, at that variant's price for their country. A test can run in selected countries only, and countries can get their own share of traffic per price: both are set in the dashboard and need nothing from your code but the visitor's country.
+- **Checkout.** Always pass `quote.currency` with `quote.price`, also before you turn regional prices on: then they need no code change later. `checkoutUrl` is `null` for a regional price: hosted checkout links are made for standard prices.
+- Bots and visitors whose country is unknown get the standard price.
+
 ## Exposures
 
-An exposure is one human seeing an experiment price. With `exposure: "auto"` (default) the SDK logs it the first time a visitor gets a price from an experiment, once per visitor and experiment (remembered in the cookie; the server deduplicates too). Prefetch and prerender requests (`Sec-Purpose`, `Purpose`, `X-Moz`, `Next-Router-Prefetch`) are priced but not counted.
+An exposure is one human seeing an experiment price. With `exposure: "auto"` (default) the SDK logs it the first time a visitor gets a price from an experiment, once per visitor and experiment (remembered in the cookie; the server deduplicates too). Prefetch and prerender requests (`Sec-Purpose`, `Purpose`, `X-Purpose`, `X-Moz`, `Next-Router-Prefetch`, and Turbo's `X-Sec-Purpose`) are priced but not counted.
 
 If you compute the price before it is visible (background render, hidden tab, modal), use manual mode:
 
@@ -137,33 +167,35 @@ The config is refreshed every 30 s (with ETag revalidation), driven by traffic. 
 
 ## Reference
 
-`getPrice(productKey, context?) → Promise<Quote>` — context: `request`, `cookie`, `userAgent`, `userId`, `exposure`, `bot`. Throws only if `productKey` is missing from `products`.
+`getPrice(productKey, context?) → Promise<Quote>` — context: `request`, `cookie`, `userAgent`, `userId`, `exposure`, `bot`, `country`. Throws only if `productKey` is missing from `products`.
 
 | Quote field | |
 |---|---|
 | `productKey` | The key you asked for |
 | `price` | Minor units; use it for display and as the checkout amount |
-| `currency` | Lowercase ISO 4217, from your product guard |
+| `currency` | Lowercase ISO 4217: your product's currency, or the region's for a regional price |
+| `country` | The visitor's country (ISO 3166-1 alpha-2) when known, else `null` |
+| `regional` | `true` when `price` is the regional price of `country` |
 | `isFallback` | `true` when `price` is your `fallbackPrice` |
 | `reason` | See below |
 | `experimentId`, `variantId` | Set when `reason` is `"experiment"`, else `null` |
 | `visitorId` | Hashed visitor id Leverprice sees; `null` unless `reason` is `"experiment"` |
 | `metadata` | `{ pp_exp, pp_var, pp_vid, pp_sig }` for the checkout (signed); `{}` otherwise |
 | `setCookie` | `Set-Cookie` values to append (zero or more) |
-| `checkoutUrl` | No-code mode: hosted checkout link for this price, or `null` |
+| `checkoutUrl` | No-code mode: hosted checkout link for this price, or `null` (always `null` for a regional price) |
 | `exposureLogged` | An exposure for this visitor and experiment has been logged (now or earlier) |
 
 | `reason` | Price |
 |---|---|
 | `experiment` | The visitor's sticky variant |
-| `base_price` | Standard price (no experiment running) |
+| `base_price` | The product's price for this visitor (no experiment runs for them) |
 | `bot` | Standard price, or fallback if unavailable; never enrolled |
 | `disabled` | Fallback: kill switch, or no valid secret key |
 | `no_config` | Fallback: no usable signed config (timeout, outage, rejected or expired); sets the pin |
 | `pinned_fallback` | Fallback: this browser got a fallback during an outage in this session |
 | `unknown_product` | Fallback: the config has no such product |
 | `currency_mismatch` | Fallback: the config's currency differs from your guard |
-| `out_of_bounds` | Fallback: a price is outside your (or Leverprice's) min/max |
+| `out_of_bounds` | Fallback: a price is outside the product's signed range |
 
 | Method | |
 |---|---|
@@ -173,7 +205,9 @@ The config is refreshed every 30 s (with ETag revalidation), driven by traffic. 
 | `flush()` | Sends queued events (≤ 500 per request; money events are retried and kept on failure) |
 | `refresh()` / `preload()` | Fetch the config now / only if none is loaded |
 
-Options: `apiUrl`, `disabled`, `timeoutMs` (500), `refreshIntervalMs` (30 s), `maxStaleMs` (24 h), `cookieName` (`__pp`), `cookieMaxAgeSeconds` (180 days), `cookieSecure` (`true`), `cookieDomain`, `flushIntervalMs` (2 s), `trustedRootKeys`, `fetch`, `onError`.
+Options: `apiUrl`, `disabled`, `timeoutMs` (500), `refreshIntervalMs` (30 s), `maxStaleMs` (24 h), `cookieName` (`__pp`), `cookieMaxAgeSeconds` (180 days), `cookieSecure` (`true`), `cookieDomain`, `countryHeader`, `localCurrencies` (`false`), `flushIntervalMs` (2 s), `trustedRootKeys`, `fetch`, `onError`.
+
+**Upgrading from 0.3:** no code changes. `minPrice` and `maxPrice` in your code are no longer used: the product's range set in Leverprice applies, and you can delete them whenever you like. If the limits in your code were tighter than that range, tighten the range in Leverprice before you upgrade. Regional prices need no code: turn them on in the dashboard and set **Project settings → Visitor country**. Add `localCurrencies: true` if your checkout passes `quote.currency` and you want prices in visitors' own currencies.
 
 **Upgrading from 0.2 (`@pricepilot/sdk`):** the package is now `@leverprice/sdk`; the deprecated `PricePilot` alias is gone (use `Leverprice`). Nothing else changed: cookies and configs are compatible.
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cookieValues, isPrefetch, readHeader, readRequest } from "../src/request.ts";
+import { cookieValues, isPrefetch, normalizeCountry, readHeader, readRequest } from "../src/request.ts";
 
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
@@ -12,6 +12,14 @@ describe("readHeader", () => {
     expect(readHeader(req, "cookie")).toBe("a=1; __pp=v.s");
     expect(readHeader(req, "User-Agent")).toBe(UA);
     expect(readHeader(req, "x-missing")).toBeNull();
+  });
+
+  it("matches header names as ASCII, never with Unicode case mapping", () => {
+    const headers = { "X-\u212aountry": "IN", "\u017fec-purpose": "prefetch", "X-COUNTRY": "BR" };
+    expect("X-\u212aountry".toLowerCase()).toBe("x-kountry");
+    expect(readHeader({ headers }, "x-kountry")).toBeNull();
+    expect(readHeader({ headers }, "sec-purpose")).toBeNull();
+    expect(readHeader({ headers }, "x-country")).toBe("BR");
   });
 
   it("reads Node-style header objects, including mixed-case keys and arrays", () => {
@@ -69,6 +77,7 @@ describe("isPrefetch", () => {
     const fetchReq = (h: Record<string, string>) => new Request("https://shop.test/", { headers: h });
     expect(isPrefetch(fetchReq({ "Sec-Purpose": "prefetch" }))).toBe(true);
     expect(isPrefetch(fetchReq({ "Sec-Purpose": "prefetch;prerender" }))).toBe(true);
+    expect(isPrefetch(fetchReq({ "X-Sec-Purpose": "prefetch" }))).toBe(true); // Turbo 8 hover prefetch
     expect(isPrefetch({ headers: { purpose: "prefetch" } })).toBe(true);
     expect(isPrefetch({ headers: { "x-purpose": "preview" } })).toBe(true);
     expect(isPrefetch({ headers: { "x-moz": "prefetch" } })).toBe(true);
@@ -93,6 +102,7 @@ describe("readRequest", () => {
       pinned: true,
       userAgent: UA,
       prefetch: false,
+      country: null,
     });
   });
 
@@ -132,6 +142,50 @@ describe("readRequest", () => {
       pinned: false,
       userAgent: null,
       prefetch: false,
+      country: null,
     });
+  });
+
+  it("reads the country from the header it is told to trust, and from nowhere else", () => {
+    const request = { headers: { "cf-ipcountry": "br", "x-vercel-ip-country": "IN" } };
+    expect(readRequest({ request }, "__pp").country).toBeNull();
+    expect(readRequest({ request }, "__pp", "cf-ipcountry").country).toBe("BR");
+    expect(readRequest({ request }, "__pp", "x-vercel-ip-country").country).toBe("IN");
+    expect(readRequest({ request, country: "de" }, "__pp", "cf-ipcountry").country).toBe("DE");
+    expect(readRequest({ request, country: "nowhere" }, "__pp", "cf-ipcountry").country).toBeNull();
+    expect(readRequest({ request, country: null }, "__pp", "cf-ipcountry").country).toBe("BR");
+    expect(
+      readRequest({ request: { headers: { "cf-ipcountry": "XX" } } }, "__pp", "cf-ipcountry").country,
+    ).toBeNull();
+    expect(
+      readRequest({ request: { headers: { "cf-ipcountry": "T1" } } }, "__pp", "cf-ipcountry").country,
+    ).toBeNull();
+  });
+});
+
+describe("normalizeCountry", () => {
+  it("accepts two ASCII letters, in any case, with ASCII whitespace around them", () => {
+    expect(normalizeCountry("US")).toBe("US");
+    expect(normalizeCountry("br")).toBe("BR");
+    expect(normalizeCountry(" de ")).toBe("DE");
+    expect(normalizeCountry("\tin\r\n")).toBe("IN");
+  });
+
+  it("refuses what is not a country", () => {
+    for (const value of ["XX", "ZZ", "T1", "A1", "A2", "AP", "EU", "", "U", "USA", "u s", "us\nde"])
+      expect(normalizeCountry(value)).toBeNull();
+    for (const value of [null, undefined, 42, ["US"], { country: "US" }])
+      expect(normalizeCountry(value)).toBeNull();
+  });
+
+  it("never lets case mapping or Unicode whitespace turn something else into a country", () => {
+    for (const value of ["ß", "ın", "ﬁ", "ſe"]) {
+      expect(value.toUpperCase()).toMatch(/^[A-Z]{2}$/);
+      expect(normalizeCountry(value)).toBeNull();
+    }
+    expect("\u212aR").toMatch(/^[a-z]{2}$/iu);
+    for (const value of ["\u212aR", "ＵＳ", "\u00a0US", "US\u00a0", "\u2003US", "\ufeffUS", "US\u0085"])
+      expect(normalizeCountry(value)).toBeNull();
+    for (const value of ["\u001cUS", "US\u0000"]) expect(normalizeCountry(value)).toBeNull();
   });
 });

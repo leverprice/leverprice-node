@@ -10,7 +10,7 @@ import {
   signAssignment,
   verifyAssignment,
 } from "./cookie.ts";
-import { type RequestInfo, type RequestLike, readRequest } from "./request.ts";
+import { normalizeCountry, type RequestInfo, type RequestLike, readHeader, readRequest } from "./request.ts";
 import { type SigningKey, TrustChain } from "./trust.ts";
 import {
   bucketFor,
@@ -29,7 +29,9 @@ import {
 import {
   CONFIG_VERSION_HEADER,
   type Config,
+  type ConfigExperiment,
   type ConfigProduct,
+  type ConfigRegion,
   eventProblem,
   MAX_EVENTS_PER_REQUEST,
   type ProviderName,
@@ -40,7 +42,7 @@ export { isBot } from "./bots.ts";
 export type { FetchRequestLike, NodeRequestLike, RequestLike } from "./request.ts";
 export type { ProviderName } from "./wire.ts";
 
-export const SDK_VERSION = "0.3.0";
+export const SDK_VERSION = "0.4.0";
 
 /** Production root public keys (raw Ed25519, base64url) by id. */
 export const ROOT_PUBLIC_KEYS: Record<string, string> = {
@@ -55,8 +57,9 @@ export interface ProductGuard {
   currency: string;
   /** Price in minor units served whenever Leverprice cannot answer. */
   fallbackPrice: number;
-  /** Hard bounds in minor units. Prices outside them are never returned. */
+  /** @deprecated Ignored since 0.4: the price range is set in Leverprice. */
   minPrice?: number;
+  /** @deprecated Ignored since 0.4: the price range is set in Leverprice. */
   maxPrice?: number;
 }
 
@@ -76,7 +79,7 @@ export type FetchLike = (
 export interface LeverpriceOptions {
   /** Secret key (`pp_sk_live_…` or `pp_sk_test_…`). Without a valid key the SDK serves fallback prices. */
   secretKey: string | undefined | null;
-  /** Products by key, with local guardrails. */
+  /** Products by key: each one's currency and fallback price. */
   products: Record<string, ProductGuard>;
   /** Serve fallback prices with no network calls. Also set by `LEVERPRICE_DISABLED=1`. */
   disabled?: boolean;
@@ -94,6 +97,16 @@ export interface LeverpriceOptions {
   /** Adds the `Secure` attribute. Default true. */
   cookieSecure?: boolean;
   cookieDomain?: string;
+  /**
+   * Request header your CDN or host sets to the visitor's country, such as `cf-ipcountry`.
+   * Overrides the project's country setting in Leverprice. Name only a header visitors cannot set.
+   */
+  countryHeader?: string;
+  /**
+   * Serve regional prices in the visitor's currency, not only in each product's own. Set it only
+   * when your checkout charges `quote.price` in `quote.currency`. Default false.
+   */
+  localCurrencies?: boolean;
   /** Maximum delay before queued exposures are sent. Default 2 s. */
   flushIntervalMs?: number;
   /** Root public keys by id. Default `ROOT_PUBLIC_KEYS`. */
@@ -119,8 +132,12 @@ export interface Quote {
   productKey: string;
   /** Price in minor units, for display and checkout. */
   price: number;
-  /** Lowercase ISO 4217 code. */
+  /** Lowercase ISO 4217 code. With a regional price it can differ from the product's currency. */
   currency: string;
+  /** The visitor's country (ISO 3166-1 alpha-2), when known. */
+  country: string | null;
+  /** `price` is the regional price of `country`. */
+  regional: boolean;
   /** `price` is the product's `fallbackPrice`. */
   isFallback: boolean;
   reason: QuoteReason;
@@ -147,6 +164,8 @@ export interface GetPriceContext {
   userAgent?: string | null;
   /** Signed-in user id: the same price on every device. Only its HMAC leaves the server. */
   userId?: string | number | null;
+  /** The visitor's country (ISO 3166-1 alpha-2). Overrides every country header. */
+  country?: string | null;
   /** `"manual"` defers the exposure to `logExposure(quote)`. Default `"auto"`. */
   exposure?: "auto" | "manual";
   /** Bot verdict that replaces the built-in user-agent check. */
@@ -177,8 +196,12 @@ export type RefundInput = {
 interface Guard {
   currency: string;
   fallbackPrice: number;
-  minPrice: number;
-  maxPrice: number;
+}
+
+interface Region {
+  index: number;
+  currency: string;
+  price: number;
 }
 
 interface RequestScope {
@@ -201,6 +224,8 @@ interface ApiResponse {
 
 const KEY_RE = /^pp_sk_(live|test)_[0-9A-Za-z]{40}$/;
 const COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const HEADER_NAME_RE = COOKIE_NAME_RE;
+const ASCII_SPACE_ENDS_RE = /^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const SIG_RE = /^[0-9a-f]{16}$/;
 const PIN_MAX_AGE_SECONDS = 1800;
@@ -227,6 +252,8 @@ export class Leverprice {
   private readonly cookieName: string;
   private readonly cookieMaxAge: number;
   private readonly cookieAttrs: CookieAttributes;
+  private readonly countryHeader: string | null;
+  private readonly localCurrencies: boolean;
   private readonly flushIntervalMs: number;
   private readonly fetchImpl: FetchLike;
   private readonly onError: ((error: Error) => void) | undefined;
@@ -264,6 +291,12 @@ export class Leverprice {
       throw new Error("Leverprice: cookieName is not a valid cookie name");
     this.cookieMaxAge = options.cookieMaxAgeSeconds ?? 180 * 24 * 3600;
     this.cookieAttrs = { secure: options.cookieSecure ?? true, domain: options.cookieDomain };
+    const header: unknown = options.countryHeader ?? "";
+    const countryHeader = typeof header === "string" ? header.replace(ASCII_SPACE_ENDS_RE, "") : null;
+    if (countryHeader === null || (countryHeader !== "" && !HEADER_NAME_RE.test(countryHeader)))
+      throw new Error("Leverprice: countryHeader is not a valid header name");
+    this.countryHeader = countryHeader === "" ? null : countryHeader.toLowerCase();
+    this.localCurrencies = options.localCurrencies === true;
     this.flushIntervalMs = options.flushIntervalMs ?? 2_000;
     this.fetchImpl = options.fetch ?? ((url, init) => fetch(url, init));
     this.onError = options.onError;
@@ -303,7 +336,7 @@ export class Leverprice {
       if (this.isOff() || quote.reason !== "experiment" || quote.exposureLogged) return false;
       const { experimentId, variantId, visitorId } = quote;
       if (!experimentId || !variantId || !visitorId) return false;
-      const queued = this.recordExposure(experimentId, variantId, visitorId);
+      const queued = this.recordExposure(experimentId, variantId, visitorId, normalizeCountry(quote.country));
       quote.exposureLogged = true;
       return queued;
     } catch (err) {
@@ -320,7 +353,7 @@ export class Leverprice {
   ): Promise<Quote> {
     let bot = false;
     try {
-      const req = readRequest(ctx, this.cookieName);
+      const req = readRequest(ctx, this.cookieName, this.countryHeader);
       bot = typeof ctx.bot === "boolean" ? ctx.bot : isBot(req.userAgent);
       if (bot) return await this.botQuote(productKey, guard);
       if (req.pinned || scope?.pinned) {
@@ -329,19 +362,28 @@ export class Leverprice {
       }
       const config = await this.currentConfig();
       if (!config) return this.noConfig(productKey, guard, scope);
+      if (typeof ctx.country !== "string" && this.countryHeader === null && config.countryHeader !== null) {
+        req.country = normalizeCountry(readHeader(ctx.request, config.countryHeader));
+      }
       const product = config.products.get(productKey);
       if (!product) return fallbackQuote(productKey, guard, "unknown_product");
       if (product.currency !== guard.currency) return fallbackQuote(productKey, guard, "currency_mismatch");
-      const exp = product.experiment;
+      const exp = experimentFor(product, req.country);
       if (!exp) {
-        return inBounds(guard, product, product.price)
-          ? priceQuote(productKey, guard, product.price, "base_price", product.checkoutUrl)
-          : fallbackQuote(productKey, guard, "out_of_bounds");
+        if (!inRange(product, product.price)) return fallbackQuote(productKey, guard, "out_of_bounds");
+        const region = this.regionFor(guard, product, req.country);
+        return region
+          ? { ...regionalQuote(productKey, guard, region, "base_price"), country: req.country }
+          : {
+              ...priceQuote(productKey, guard, product.price, "base_price", product.checkoutUrl),
+              country: req.country,
+            };
       }
-      if (exp.variants.length === 0 || !exp.variants.every((v) => inBounds(guard, product, v.price))) {
+      if (exp.variants.length === 0 || !exp.variants.every((v) => inRange(product, v.price))) {
         return fallbackQuote(productKey, guard, "out_of_bounds");
       }
-      return await this.experimentQuote(productKey, guard, ctx, req, scope, config, product, exp);
+      const region = this.regionFor(guard, product, req.country);
+      return await this.experimentQuote(productKey, guard, ctx, req, scope, config, product, exp, region);
     } catch (err) {
       this.report(err);
       return bot ? fallbackQuote(productKey, guard, "bot") : this.noConfig(productKey, guard, scope);
@@ -356,7 +398,8 @@ export class Leverprice {
     scope: RequestScope | null,
     config: Config,
     product: ConfigProduct,
-    exp: NonNullable<ConfigProduct["experiment"]>,
+    exp: ConfigExperiment,
+    region: Region | null,
   ): Promise<Quote> {
     const key = await this.hmacKeyFor(config.assignmentKey);
 
@@ -387,7 +430,13 @@ export class Leverprice {
 
     const assigned = own(state.a, exp.id);
     const sticky = assigned === undefined ? undefined : exp.variants.find((v) => v.id === assigned);
-    const variant = sticky ?? pickVariant(exp.variants, await bucketFor(exp.salt, visitorId));
+    const variant =
+      sticky ??
+      pickVariant(
+        exp.variants,
+        await bucketFor(exp.salt, visitorId),
+        req.country === null ? undefined : exp.splitOf.get(req.country),
+      );
     if (!sticky) {
       assign(state, exp.id, variant.id);
       changed = true;
@@ -395,7 +444,7 @@ export class Leverprice {
 
     let logged = state.x.includes(exp.id) || this.exposed.has(`${exp.id}:${visitorId}`);
     if (!logged && (ctx.exposure ?? "auto") === "auto" && !req.prefetch) {
-      this.recordExposure(exp.id, variant.id, visitorId);
+      this.recordExposure(exp.id, variant.id, visitorId, req.country);
       logged = true;
     }
     if (logged && markExposed(state, exp.id)) changed = true;
@@ -404,8 +453,10 @@ export class Leverprice {
     const signature = await hmacHex(key, `pp:attr:v1:${exp.id}:${variant.id}:${visitorId}`, 16);
     return {
       productKey,
-      price: variant.price,
-      currency: guard.currency,
+      price: region ? variant.regional[region.index]! : variant.price,
+      currency: region ? region.currency : guard.currency,
+      country: req.country,
+      regional: region !== null,
       isFallback: false,
       reason: "experiment",
       experimentId: exp.id,
@@ -422,15 +473,28 @@ export class Leverprice {
             ),
           ]
         : [],
-      checkoutUrl: variant.checkoutUrl ?? product.checkoutUrl ?? null,
+      checkoutUrl: region ? null : (variant.checkoutUrl ?? product.checkoutUrl ?? null),
       exposureLogged: logged,
     };
+  }
+
+  /**
+   * The visitor's region when its price may be served: the product has one for the country, in the
+   * guard's currency unless local currencies are allowed.
+   */
+  private regionFor(guard: Guard, product: ConfigProduct, country: string | null): Region | null {
+    if (country === null) return null;
+    const index = product.regionOf.get(country);
+    if (index === undefined) return null;
+    const region = product.regions[index] as ConfigRegion;
+    if (region.currency !== guard.currency && !this.localCurrencies) return null;
+    return { index, currency: region.currency, price: region.price };
   }
 
   private async botQuote(productKey: string, guard: Guard): Promise<Quote> {
     const config = await this.currentConfig();
     const product = config?.products.get(productKey);
-    if (product && product.currency === guard.currency && inBounds(guard, product, product.price)) {
+    if (product && product.currency === guard.currency && inRange(product, product.price)) {
       return priceQuote(productKey, guard, product.price, "bot", product.checkoutUrl);
     }
     return fallbackQuote(productKey, guard, "bot");
@@ -655,12 +719,24 @@ export class Leverprice {
     if (v > (this.config?.version ?? 0)) this.kick(Date.now());
   }
 
-  private recordExposure(experimentId: string, variantId: string, visitorId: string): boolean {
+  private recordExposure(
+    experimentId: string,
+    variantId: string,
+    visitorId: string,
+    country: string | null,
+  ): boolean {
     const k = `${experimentId}:${visitorId}`;
     if (this.exposed.has(k)) return false;
     if (this.exposed.size >= MAX_DEDUPE) this.exposed.clear();
     this.exposed.add(k);
-    return this.enqueue({ type: "exposure", experimentId, variantId, visitorId, timestamp: Date.now() });
+    return this.enqueue({
+      type: "exposure",
+      experimentId,
+      variantId,
+      visitorId,
+      timestamp: Date.now(),
+      ...(country ? { country } : {}),
+    });
   }
 
   private enqueue(e: WireEvent): boolean {
@@ -838,23 +914,21 @@ function normalizeGuards(products: Record<string, ProductGuard>): Map<string, Gu
     if (!Number.isSafeInteger(g.fallbackPrice) || g.fallbackPrice <= 0) {
       throw new Error(`${where}.fallbackPrice must be a positive integer (minor units)`);
     }
-    const minPrice = g.minPrice ?? 1;
-    const maxPrice = g.maxPrice ?? Number.MAX_SAFE_INTEGER;
-    if (!Number.isSafeInteger(minPrice) || !Number.isSafeInteger(maxPrice) || minPrice > maxPrice) {
-      throw new Error(`${where}: minPrice and maxPrice must be integers with minPrice <= maxPrice`);
-    }
-    out.set(key, { currency: g.currency.toLowerCase(), fallbackPrice: g.fallbackPrice, minPrice, maxPrice });
+    out.set(key, { currency: g.currency.toLowerCase(), fallbackPrice: g.fallbackPrice });
   }
   return out;
 }
 
-function inBounds(guard: Guard, product: ConfigProduct, price: number): boolean {
-  return (
-    Number.isSafeInteger(price) &&
-    price > 0 &&
-    price >= Math.max(guard.minPrice, product.minPrice) &&
-    price <= Math.min(guard.maxPrice, product.maxPrice)
-  );
+/** The product's test as it applies to a visitor from `country`: a scoped test only inside its scope. */
+function experimentFor(product: ConfigProduct, country: string | null): ConfigExperiment | null {
+  const exp = product.experiment;
+  if (!exp || exp.scope === null) return exp;
+  return country !== null && exp.scope.has(country) ? exp : null;
+}
+
+/** A standard or test price inside the product's signed price range. */
+function inRange(product: ConfigProduct, price: number): boolean {
+  return Number.isSafeInteger(price) && price > 0 && price >= product.minPrice && price <= product.maxPrice;
 }
 
 function fallbackQuote(
@@ -867,6 +941,8 @@ function fallbackQuote(
     productKey,
     price: guard.fallbackPrice,
     currency: guard.currency,
+    country: null,
+    regional: false,
     isFallback: true,
     reason,
     experimentId: null,
@@ -891,6 +967,16 @@ function priceQuote(
     price,
     isFallback: false,
     checkoutUrl: checkoutUrl ?? null,
+  };
+}
+
+function regionalQuote(productKey: string, guard: Guard, region: Region, reason: "base_price"): Quote {
+  return {
+    ...fallbackQuote(productKey, guard, reason),
+    price: region.price,
+    currency: region.currency,
+    regional: true,
+    isFallback: false,
   };
 }
 
